@@ -7,6 +7,35 @@ const { parse } = require('csv-parse/sync');
 const MASTER_CSV = 'master_connections.csv';
 const EMAIL_CSV = 'connections_emails.csv';
 
+// Anti-detection randomization utilities
+function getRandomDelay(min, max) {
+  return min + Math.floor(Math.random() * (max - min + 1));
+}
+
+function getRandomScrollDistance() {
+  return 80 + Math.floor(Math.random() * 40); // 80-120px
+}
+
+function getRandomScrollInterval() {
+  return 150 + Math.floor(Math.random() * 100); // 150-250ms
+}
+
+async function humanLikeDelay(minMs = 500, maxMs = 2000) {
+  const delay = getRandomDelay(minMs, maxMs);
+  await new Promise(resolve => setTimeout(resolve, delay));
+}
+
+async function randomMouseMovement(page) {
+  try {
+    const viewport = await page.viewport();
+    const x = Math.floor(Math.random() * viewport.width);
+    const y = Math.floor(Math.random() * viewport.height);
+    await page.mouse.move(x, y, { steps: getRandomDelay(5, 15) });
+  } catch (error) {
+    // Ignore mouse movement errors
+  }
+}
+
 function loadExistingConnections() {
   if (!fs.existsSync(MASTER_CSV)) {
     return new Map();
@@ -183,9 +212,10 @@ async function processEmailsForPage(page, sourceProfile, pageNumber) {
   
   console.log(`Processing emails for ${connectionsToProcess.length} connections from page ${pageNumber}`);
   
-  // Re-open home to ensure hydration
+  // Re-open home to ensure hydration with random delay
   await page.goto('https://www.linkedin.com/feed/', { waitUntil: 'domcontentloaded' });
-  await new Promise(r => setTimeout(r, 1200));
+  await humanLikeDelay(800, 1500);
+  await randomMouseMovement(page);
 
   for (let i = 0; i < connectionsToProcess.length; i++) {
     const connection = connectionsToProcess[i];
@@ -195,12 +225,20 @@ async function processEmailsForPage(page, sourceProfile, pageNumber) {
     console.log(`[${i + 1}/${connectionsToProcess.length}] Processing: ${connection['Full Name']}`);
     console.log(`URL: ${overlayUrl}`);
     
+    // Random delay before navigation
+    await humanLikeDelay(300, 800);
+    
     try {
       await page.goto(overlayUrl, { waitUntil: 'domcontentloaded' });
-      await new Promise(r => setTimeout(r, 1500));
+      
+      // Human-like delay with random mouse movement
+      await humanLikeDelay(1000, 2500);
+      await randomMouseMovement(page);
 
       let email = 'Not available';
       try {
+        // Small delay before trying to extract email
+        await humanLikeDelay(200, 600);
         const mailtos = await page.$$eval('a[href^="mailto:"]', as => as.map(a => a.href));
         if (mailtos.length > 0) email = mailtos[0].replace('mailto:', '');
       } catch {}
@@ -214,18 +252,29 @@ async function processEmailsForPage(page, sourceProfile, pageNumber) {
       updateConnectionEmailStatus(baseUrl, 'Error', 'error');
     }
 
-    // Add delay between requests
-    await new Promise(r => setTimeout(r, 800 + Math.floor(Math.random() * 1000)));
+    // Randomized delay between requests (1.5-4 seconds)
+    await humanLikeDelay(1500, 4000);
+    
+    // Occasional longer pause (every 3-7 connections)
+    if (i > 0 && i % getRandomDelay(3, 7) === 0) {
+      console.log('Taking a longer break to appear more human...');
+      await humanLikeDelay(8000, 15000);
+      await randomMouseMovement(page);
+    }
   }
   
   console.log(`Completed email processing for page ${pageNumber}`);
 }
 
 async function scrapeConnectionsFromPage(page, listItemSelector) {
-  // Scroll to load all items on current page
+  // Scroll to load all items on current page with randomization
   console.log('Scrolling to load items...');
-  await autoScroll(page);
-  await new Promise(resolve => setTimeout(resolve, 1000));
+  await humanizedAutoScroll(page);
+  await humanLikeDelay(800, 1500);
+
+  // Random mouse movement before scraping
+  await randomMouseMovement(page);
+  await humanLikeDelay(300, 700);
 
   // Scrape connections using the same logic as before
   console.log('Scraping connections...');
@@ -256,9 +305,10 @@ async function navigateToNextPage(page, currentPage) {
   try {
     console.log(`Attempting to navigate to page ${currentPage + 1}...`);
     
-    // Scroll to reveal pagination
-    await autoScroll(page);
-    await new Promise(resolve => setTimeout(resolve, 800));
+    // Scroll to reveal pagination with randomization
+    await humanizedAutoScroll(page);
+    await humanLikeDelay(500, 1200);
+    await randomMouseMovement(page);
 
     // Capture the first result URN to detect list refresh
     let firstUrn = null;
@@ -273,11 +323,20 @@ async function navigateToNextPage(page, currentPage) {
     console.log('Waiting for pagination controls...');
     await page.waitForSelector(paginationContainer, { timeout: 20000 });
 
+    // Human-like pause before clicking
+    await humanLikeDelay(800, 1500);
+    await randomMouseMovement(page);
+
     let clicked = false;
     
     // Try specific page button first
     try {
       await page.waitForSelector(nextPageButton, { timeout: 7000 });
+      
+      // Hover over button first for more human-like behavior
+      await page.hover(nextPageButton);
+      await humanLikeDelay(200, 600);
+      
       await page.click(nextPageButton);
       clicked = true;
       console.log(`Clicked page ${currentPage + 1} button.`);
@@ -290,6 +349,11 @@ async function navigateToNextPage(page, currentPage) {
           console.log('Next button is disabled, no more pages available');
           return false;
         }
+        
+        // Hover over Next button first
+        await page.hover(nextButton);
+        await humanLikeDelay(200, 600);
+        
         await page.click(nextButton);
         clicked = true;
         console.log('Clicked Next button.');
@@ -347,10 +411,27 @@ async function navigateToNextPage(page, currentPage) {
   const userDataDir = path.join(__dirname, '..', 'linkedin-session');
   const browser = await puppeteer.launch({
     headless: false,
-    userDataDir: userDataDir
+    userDataDir: userDataDir,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-blink-features=AutomationControlled',
+      '--disable-web-security',
+      '--user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+    ]
   });
   const page = await browser.newPage();
+  
+  // Set random viewport size to appear more human
+  const viewportWidth = 1200 + Math.floor(Math.random() * 600); // 1200-1800
+  const viewportHeight = 800 + Math.floor(Math.random() * 400); // 800-1200
+  await page.setViewport({ width: viewportWidth, height: viewportHeight });
+  
+  // Randomize user agent slightly
+  await page.setUserAgent('Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36');
+  
   await page.goto('https://www.linkedin.com/feed/');
+  await humanLikeDelay(1000, 2500);
 
   // Check if we are already logged in
   const isLoggedIn = await page.$('#global-nav') !== null;
@@ -368,10 +449,16 @@ async function navigateToNextPage(page, currentPage) {
   await page.goto(profileUrl);
   console.log(`Navigated to profile page for ${profileUrl}`);
 
-  // Click the connections link
+  // Click the connections link with human-like behavior
   console.log('Finding and clicking connections link...');
   const connectionsLinkSelector = 'a[href*="/search/results/people/?connectionOf="]';
   await page.waitForSelector(connectionsLinkSelector);
+  
+  // Add human-like interaction
+  await randomMouseMovement(page);
+  await humanLikeDelay(500, 1200);
+  await page.hover(connectionsLinkSelector);
+  await humanLikeDelay(200, 600);
   
   // Click and wait for navigation to complete
   await Promise.all([
@@ -447,11 +534,21 @@ async function navigateToNextPage(page, currentPage) {
     console.log(`Processing emails for page ${currentPage} connections...`);
     await processEmailsForPage(page, profileUrl, currentPage);
     
+    // Random break between pages to appear more human
+    if (currentPage > 1) {
+      console.log('Taking a break between pages...');
+      await humanLikeDelay(3000, 8000);
+      await randomMouseMovement(page);
+    }
+    
     // Try to navigate to next page
     hasMorePages = await navigateToNextPage(page, currentPage);
     
     if (hasMorePages) {
       currentPage++;
+      
+      // Human-like delay after navigation
+      await humanLikeDelay(1500, 3000);
       
       // Wait for new page to load and update selector if needed
       try {
@@ -488,22 +585,48 @@ async function navigateToNextPage(page, currentPage) {
   
   await browser.close();
 })();
-async function autoScroll(page){
+// Humanized auto-scroll with randomization
+async function humanizedAutoScroll(page) {
   await page.evaluate(async () => {
     await new Promise((resolve) => {
-      var totalHeight = 0;
-      var distance = 100;
-      var timer = setInterval(() => {
-        var scrollHeight = document.body.scrollHeight;
+      let totalHeight = 0;
+      let lastHeight = 0;
+      let scrollAttempts = 0;
+      const maxAttempts = 3;
+      
+      const scroll = () => {
+        const distance = 80 + Math.floor(Math.random() * 40); // 80-120px
+        const scrollHeight = document.body.scrollHeight;
+        
         window.scrollBy(0, distance);
         totalHeight += distance;
-
-        if(totalHeight >= scrollHeight - window.innerHeight){
-          clearInterval(timer);
-          resolve();
+        
+        // Check if we've reached the bottom or if height hasn't changed
+        if (totalHeight >= scrollHeight - window.innerHeight) {
+          if (scrollHeight === lastHeight) {
+            scrollAttempts++;
+            if (scrollAttempts >= maxAttempts) {
+              resolve();
+              return;
+            }
+          } else {
+            lastHeight = scrollHeight;
+            scrollAttempts = 0;
+          }
         }
-      }, 200); // Slower scroll
+        
+        // Random scroll interval between 150-300ms
+        const interval = 150 + Math.floor(Math.random() * 150);
+        setTimeout(scroll, interval);
+      };
+      
+      scroll();
     });
   });
+}
+
+// Fallback to original autoScroll for compatibility
+async function autoScroll(page) {
+  await humanizedAutoScroll(page);
 }
 
