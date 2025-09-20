@@ -1,6 +1,225 @@
 const puppeteer = require('puppeteer');
 const path = require('path');
+const fs = require('fs');
 const { parse } = require('csv-parse/sync');
+
+// CSV Management Functions
+const MASTER_CSV = 'master_connections.csv';
+const EMAIL_CSV = 'connections_emails.csv';
+
+function loadExistingConnections() {
+  if (!fs.existsSync(MASTER_CSV)) {
+    return new Map();
+  }
+  
+  const csvContent = fs.readFileSync(MASTER_CSV, 'utf-8');
+  const rows = parse(csvContent, { columns: true, skip_empty_lines: true });
+  const connectionMap = new Map();
+  
+  rows.forEach(row => {
+    // Use the base profile URL (without query params) as the key for deduplication
+    const baseUrl = row['Profile URL'].split('?')[0];
+    connectionMap.set(baseUrl, {
+      ...row,
+      baseUrl
+    });
+  });
+  
+  return connectionMap;
+}
+
+function saveConnectionsToMaster(connections, startingProfileUrl, currentPage) {
+  const existingConnections = loadExistingConnections();
+  let newConnections = 0;
+  let duplicateConnections = 0;
+  
+  connections.forEach(conn => {
+    const baseUrl = conn.profileUrl.split('?')[0];
+    
+    if (!existingConnections.has(baseUrl)) {
+      existingConnections.set(baseUrl, {
+        'Full Name': conn.fullName,
+        'Profile URL': conn.profileUrl,
+        'Current Employer': conn.currentEmployer,
+        'Base URL': baseUrl,
+        'Source Profile': startingProfileUrl,
+        'Page Found': currentPage,
+        'Date Added': new Date().toISOString().split('T')[0],
+        'Email Status': 'pending',
+        'Processing Status': 'new'
+      });
+      newConnections++;
+    } else {
+      duplicateConnections++;
+      console.log(`Duplicate found: ${conn.fullName} (${baseUrl})`);
+    }
+  });
+  
+  // Write all connections back to master CSV
+  const header = 'Full Name,Profile URL,Current Employer,Base URL,Source Profile,Page Found,Date Added,Email Status,Processing Status\n';
+  const rows = Array.from(existingConnections.values());
+  const body = rows.map(r => 
+    `"${r['Full Name']}","${r['Profile URL']}","${r['Current Employer']}","${r['Base URL']}","${r['Source Profile']}","${r['Page Found']}","${r['Date Added']}","${r['Email Status']}","${r['Processing Status']}"`
+  ).join('\n');
+  
+  fs.writeFileSync(MASTER_CSV, header + body);
+  
+  console.log(`Master CSV updated: ${newConnections} new connections, ${duplicateConnections} duplicates skipped`);
+  return { newConnections, duplicateConnections };
+}
+
+function getConnectionsToProcess() {
+  if (!fs.existsSync(MASTER_CSV)) {
+    return [];
+  }
+  
+  const csvContent = fs.readFileSync(MASTER_CSV, 'utf-8');
+  const rows = parse(csvContent, { columns: true, skip_empty_lines: true });
+  
+  return rows.filter(row => row['Email Status'] === 'pending');
+}
+
+function updateConnectionEmailStatus(baseUrl, email, status = 'completed') {
+  if (!fs.existsSync(MASTER_CSV)) {
+    return;
+  }
+  
+  const csvContent = fs.readFileSync(MASTER_CSV, 'utf-8');
+  const rows = parse(csvContent, { columns: true, skip_empty_lines: true });
+  
+  // Update the specific connection
+  const updatedRows = rows.map(row => {
+    if (row['Base URL'] === baseUrl) {
+      return {
+        ...row,
+        'Email Status': status,
+        'Processing Status': 'processed',
+        'Last Processed': new Date().toISOString().split('T')[0]
+      };
+    }
+    return row;
+  });
+  
+  // Save back to master CSV with updated header to include Last Processed
+  const header = 'Full Name,Profile URL,Current Employer,Base URL,Source Profile,Page Found,Date Added,Email Status,Processing Status,Last Processed\n';
+  const body = updatedRows.map(r => 
+    `"${r['Full Name']}","${r['Profile URL']}","${r['Current Employer']}","${r['Base URL']}","${r['Source Profile']}","${r['Page Found']}","${r['Date Added']}","${r['Email Status']}","${r['Processing Status']}","${r['Last Processed'] || ''}"`
+  ).join('\n');
+  
+  fs.writeFileSync(MASTER_CSV, header + body);
+  
+  // Save email to separate CSV
+  if (email && email !== 'Not available') {
+    saveEmailToCSV(baseUrl, updatedRows.find(r => r['Base URL'] === baseUrl), email);
+  }
+}
+
+function saveEmailToCSV(baseUrl, connectionData, email) {
+  const emailEntry = {
+    'Full Name': connectionData['Full Name'],
+    'Profile URL': connectionData['Profile URL'],
+    'Base URL': baseUrl,
+    'Email': email,
+    'Date Extracted': new Date().toISOString().split('T')[0],
+    'Source Profile': connectionData['Source Profile']
+  };
+  
+  let existingEmails = [];
+  if (fs.existsSync(EMAIL_CSV)) {
+    const csvContent = fs.readFileSync(EMAIL_CSV, 'utf-8');
+    existingEmails = parse(csvContent, { columns: true, skip_empty_lines: true });
+  }
+  
+  // Check if email already exists for this base URL
+  const emailExists = existingEmails.some(e => e['Base URL'] === baseUrl);
+  
+  if (!emailExists) {
+    existingEmails.push(emailEntry);
+    
+    const header = 'Full Name,Profile URL,Base URL,Email,Date Extracted,Source Profile\n';
+    const body = existingEmails.map(e => 
+      `"${e['Full Name']}","${e['Profile URL']}","${e['Base URL']}","${e['Email']}","${e['Date Extracted']}","${e['Source Profile']}"`
+    ).join('\n');
+    
+    fs.writeFileSync(EMAIL_CSV, header + body);
+    console.log(`Email saved for ${connectionData['Full Name']}: ${email}`);
+  }
+}
+
+function getProgressInfo() {
+  if (!fs.existsSync(MASTER_CSV)) {
+    return { lastPage: 0, totalConnections: 0, processedEmails: 0 };
+  }
+  
+  const csvContent = fs.readFileSync(MASTER_CSV, 'utf-8');
+  const rows = parse(csvContent, { columns: true, skip_empty_lines: true });
+  
+  const lastPage = Math.max(...rows.map(r => parseInt(r['Page Found']) || 0));
+  const totalConnections = rows.length;
+  const processedEmails = rows.filter(r => r['Email Status'] === 'completed').length;
+  
+  return { lastPage, totalConnections, processedEmails };
+}
+
+async function processEmailsForPage(page, sourceProfile, pageNumber) {
+  if (!fs.existsSync(MASTER_CSV)) {
+    console.log('No master CSV found, skipping email processing');
+    return;
+  }
+  
+  const csvContent = fs.readFileSync(MASTER_CSV, 'utf-8');
+  const rows = parse(csvContent, { columns: true, skip_empty_lines: true });
+  
+  // Filter for connections from this page that need email processing
+  const connectionsToProcess = rows.filter(row => 
+    row['Page Found'] === pageNumber.toString() && 
+    row['Email Status'] === 'pending'
+  );
+  
+  if (connectionsToProcess.length === 0) {
+    console.log(`No pending email processing for page ${pageNumber}`);
+    return;
+  }
+  
+  console.log(`Processing emails for ${connectionsToProcess.length} connections from page ${pageNumber}`);
+  
+  // Re-open home to ensure hydration
+  await page.goto('https://www.linkedin.com/feed/', { waitUntil: 'domcontentloaded' });
+  await new Promise(r => setTimeout(r, 1200));
+
+  for (let i = 0; i < connectionsToProcess.length; i++) {
+    const connection = connectionsToProcess[i];
+    const baseUrl = connection['Base URL'];
+    const overlayUrl = `${baseUrl.endsWith('/') ? baseUrl : baseUrl + '/'}overlay/contact-info/`;
+    
+    console.log(`[${i + 1}/${connectionsToProcess.length}] Processing: ${connection['Full Name']}`);
+    console.log(`URL: ${overlayUrl}`);
+    
+    try {
+      await page.goto(overlayUrl, { waitUntil: 'domcontentloaded' });
+      await new Promise(r => setTimeout(r, 1500));
+
+      let email = 'Not available';
+      try {
+        const mailtos = await page.$$eval('a[href^="mailto:"]', as => as.map(a => a.href));
+        if (mailtos.length > 0) email = mailtos[0].replace('mailto:', '');
+      } catch {}
+
+      // Update the connection with email status
+      updateConnectionEmailStatus(baseUrl, email);
+      console.log(`Email for ${connection['Full Name']}: ${email}`);
+
+    } catch (error) {
+      console.log(`Error processing ${connection['Full Name']}: ${error.message}`);
+      updateConnectionEmailStatus(baseUrl, 'Error', 'error');
+    }
+
+    // Add delay between requests
+    await new Promise(r => setTimeout(r, 800 + Math.floor(Math.random() * 1000)));
+  }
+  
+  console.log(`Completed email processing for page ${pageNumber}`);
+}
 
 (async () => {
   const profileUrl = process.argv[2];
@@ -9,6 +228,15 @@ const { parse } = require('csv-parse/sync');
     console.error('Example: node src/index.js https://www.linkedin.com/in/davidbeer1/');
     return;
   }
+
+  // Show progress info
+  const progressInfo = getProgressInfo();
+  console.log(`\n=== Progress Summary ===`);
+  console.log(`Total connections in master CSV: ${progressInfo.totalConnections}`);
+  console.log(`Emails processed: ${progressInfo.processedEmails}`);
+  console.log(`Last page processed: ${progressInfo.lastPage}`);
+  console.log(`Starting profile: ${profileUrl}`);
+  console.log(`======================\n`);
 
   const userDataDir = path.join(__dirname, '..', 'linkedin-session');
   const browser = await puppeteer.launch({
@@ -116,13 +344,14 @@ const { parse } = require('csv-parse/sync');
   });
 
   console.log(`Collected ${connections.length} connections.`);
-  {
-    const fs = require('fs');
-    const header = 'Full Name,Profile URL,Current Employer\n';
-    const body = connections.map(r => `"${r.fullName}","${r.profileUrl}","${r.currentEmployer}"`).join('\n');
-    fs.writeFileSync('connections.csv', header + body);
-    console.log('Saved connections.csv');
-  }
+  
+  // Save to master CSV with duplicate prevention
+  const saveResult = saveConnectionsToMaster(connections, profileUrl, 1);
+  console.log(`Page 1: ${saveResult.newConnections} new, ${saveResult.duplicateConnections} duplicates`);
+  
+  // Process emails for page 1 connections
+  console.log('Processing emails for page 1 connections...');
+  await processEmailsForPage(page, profileUrl, 1);
 
   // Navigate to page 2 and scrape next 10
   try {
@@ -201,59 +430,14 @@ const { parse } = require('csv-parse/sync');
       });
 
       console.log(`Collected ${connections2.length} connections from Page 2.`);
-      {
-        const fs = require('fs');
-        const header = 'Full Name,Profile URL,Current Employer\n';
-        const body = connections2.map(r => `"${r.fullName}","${r.profileUrl}","${r.currentEmployer}"`).join('\n');
-        fs.writeFileSync('connections_page2.csv', header + body);
-        console.log('Saved connections_page2.csv');
-      }
+      
+      // Save to master CSV with duplicate prevention
+      const saveResult2 = saveConnectionsToMaster(connections2, profileUrl, 2);
+      console.log(`Page 2: ${saveResult2.newConnections} new, ${saveResult2.duplicateConnections} duplicates`);
 
-      // Process connections_page2.csv to extract emails via contact overlay
-      try {
-        const fs = require('fs');
-        if (fs.existsSync('connections_page2.csv')) {
-          console.log('Processing connections_page2.csv for emails...');
-          const csvContent = fs.readFileSync('connections_page2.csv', 'utf-8');
-          const rows = parse(csvContent, { columns: true, skip_empty_lines: true });
-
-          // Re-open home to ensure hydration
-          await page.goto('https://www.linkedin.com/feed/', { waitUntil: 'domcontentloaded' });
-          await new Promise(r => setTimeout(r, 1200));
-
-          const enriched = [];
-          for (let i = 0; i < rows.length; i++) {
-            const row = rows[i];
-            const base = row['Profile URL'].split('?')[0];
-            const overlayUrl = `${base.endsWith('/') ? base : base + '/'}overlay/contact-info/`;
-            console.log(`[${i + 1}/${rows.length}] ${overlayUrl}`);
-            await page.goto(overlayUrl, { waitUntil: 'domcontentloaded' });
-            await new Promise(r => setTimeout(r, 1500));
-
-            let email = 'Not available';
-            try {
-              const mailtos = await page.$$eval('a[href^="mailto:"]', as => as.map(a => a.href));
-              if (mailtos.length > 0) email = mailtos[0].replace('mailto:', '');
-            } catch {}
-
-            enriched.push({
-              'Full Name': row['Full Name'],
-              'Profile URL': row['Profile URL'],
-              'Current Employer': row['Current Employer'],
-              'Email': email,
-            });
-
-            await new Promise(r => setTimeout(r, 800 + Math.floor(Math.random() * 1000)));
-          }
-
-          const outHeader = 'Full Name,Profile URL,Current Employer,Email\n';
-          const outBody = enriched.map(r => `"${r['Full Name']}","${r['Profile URL']}","${r['Current Employer']}","${r['Email']}"`).join('\n');
-          fs.writeFileSync('connections_page2_with_emails.csv', outHeader + outBody);
-          console.log('Saved connections_page2_with_emails.csv');
-        }
-      } catch (e) {
-        console.log('Email enrichment for page 2 skipped due to error:', e?.message || e);
-      }
+      // Process emails for page 2 connections
+      console.log('Processing emails for page 2 connections...');
+      await processEmailsForPage(page, profileUrl, 2);
     }
   } catch (err) {
     console.log('Page 2 navigation or scraping skipped due to error:', err?.message || err);
