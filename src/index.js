@@ -221,6 +221,112 @@ async function processEmailsForPage(page, sourceProfile, pageNumber) {
   console.log(`Completed email processing for page ${pageNumber}`);
 }
 
+async function scrapeConnectionsFromPage(page, listItemSelector) {
+  // Scroll to load all items on current page
+  console.log('Scrolling to load items...');
+  await autoScroll(page);
+  await new Promise(resolve => setTimeout(resolve, 1000));
+
+  // Scrape connections using the same logic as before
+  console.log('Scraping connections...');
+  const connections = await page.$$eval(listItemSelector, nodes => {
+    const results = [];
+    for (const item of nodes) {
+      const nameContainer = item.querySelector('span[dir="ltr"]');
+      if (!nameContainer) continue;
+      const linkElement = nameContainer.closest('a');
+      if (!linkElement) continue;
+      const nameElement = nameContainer.querySelector('span[aria-hidden="true"]');
+      const employerElement = item.querySelector('.t-14.t-normal, .entity-result__primary-subtitle');
+      const fullName = nameElement ? nameElement.innerText.trim() : nameContainer.textContent.trim();
+      const profileUrl = linkElement.href;
+      const currentEmployer = employerElement ? employerElement.textContent.trim() : 'Not available';
+      if (fullName && profileUrl) {
+        results.push({ fullName, profileUrl, currentEmployer });
+      }
+      if (results.length >= 10) break;
+    }
+    return results;
+  });
+  
+  return connections;
+}
+
+async function navigateToNextPage(page, currentPage) {
+  try {
+    console.log(`Attempting to navigate to page ${currentPage + 1}...`);
+    
+    // Scroll to reveal pagination
+    await autoScroll(page);
+    await new Promise(resolve => setTimeout(resolve, 800));
+
+    // Capture the first result URN to detect list refresh
+    let firstUrn = null;
+    try {
+      firstUrn = await page.$eval('div[data-chameleon-result-urn]', el => el.getAttribute('data-chameleon-result-urn'));
+    } catch {}
+
+    const paginationContainer = 'div.artdeco-pagination';
+    const nextPageButton = `li[data-test-pagination-page-btn="${currentPage + 1}"] > button`;
+    const nextButton = 'button.artdeco-pagination__button--next[aria-label="Next"]';
+
+    console.log('Waiting for pagination controls...');
+    await page.waitForSelector(paginationContainer, { timeout: 20000 });
+
+    let clicked = false;
+    
+    // Try specific page button first
+    try {
+      await page.waitForSelector(nextPageButton, { timeout: 7000 });
+      await page.click(nextPageButton);
+      clicked = true;
+      console.log(`Clicked page ${currentPage + 1} button.`);
+    } catch {
+      console.log(`Page ${currentPage + 1} button not found, trying Next button...`);
+      try {
+        await page.waitForSelector(nextButton, { timeout: 10000 });
+        const isDisabled = await page.$eval(nextButton, el => el.disabled || el.getAttribute('aria-disabled') === 'true');
+        if (isDisabled) {
+          console.log('Next button is disabled, no more pages available');
+          return false;
+        }
+        await page.click(nextButton);
+        clicked = true;
+        console.log('Clicked Next button.');
+      } catch {
+        console.log('No pagination controls found, likely on last page');
+        return false;
+      }
+    }
+
+    if (clicked) {
+      const prevUrl = page.url();
+      
+      // Wait for the page content to change
+      try {
+        await page.waitForFunction((prevUrn, prevUrl, nextPage) => {
+          const first = document.querySelector('div[data-chameleon-result-urn]');
+          const currUrn = first ? first.getAttribute('data-chameleon-result-urn') : null;
+          const url = window.location.href;
+          const urlChanged = new RegExp('[?&](page=' + nextPage + '|start=\\d+)').test(url) && url !== prevUrl;
+          return (currUrn && currUrn !== prevUrn) || urlChanged;
+        }, { timeout: 20000 }, firstUrn, prevUrl, currentPage + 1);
+        
+        console.log(`Successfully navigated to page ${currentPage + 1}`);
+        return true;
+      } catch {
+        console.log('Failed to detect page change');
+        return false;
+      }
+    }
+    
+    return false;
+  } catch (error) {
+    console.log(`Error navigating to page ${currentPage + 1}: ${error.message}`);
+    return false;
+  }
+}
+
 (async () => {
   const profileUrl = process.argv[2];
   if (!profileUrl || !profileUrl.startsWith('https://www.linkedin.com/in/')) {
@@ -304,8 +410,10 @@ async function processEmailsForPage(page, sourceProfile, pageNumber) {
     console.log('Already showing 1st degree connections.');
   }
 
-  // Reinstate first-page scrape → write connections.csv (robust selectors)
-  // 1) Wait for results list presence (list items), fallback if needed
+  // Dynamic pagination loop - process all available pages
+  console.log('Starting dynamic pagination loop...');
+  
+  // Determine list item selector
   let listItemSelector = 'ul[role="list"] > li';
   try {
     console.log('Waiting for results list...');
@@ -316,131 +424,45 @@ async function processEmailsForPage(page, sourceProfile, pageNumber) {
     await page.waitForSelector(listItemSelector, { timeout: 20000 });
   }
 
-  // 2) Scroll to load all first-page items
-  console.log('Scrolling to load items...');
-  await autoScroll(page);
-  await new Promise(resolve => setTimeout(resolve, 1000));
-
-  // 3) Scrape first 10 connections using span[dir="ltr"] → closest('a')
-  console.log('Scraping first 10 connections...');
-  const connections = await page.$$eval(listItemSelector, nodes => {
-    const results = [];
-    for (const item of nodes) {
-      const nameContainer = item.querySelector('span[dir="ltr"]');
-      if (!nameContainer) continue;
-      const linkElement = nameContainer.closest('a');
-      if (!linkElement) continue;
-      const nameElement = nameContainer.querySelector('span[aria-hidden="true"]');
-      const employerElement = item.querySelector('.t-14.t-normal, .entity-result__primary-subtitle');
-      const fullName = nameElement ? nameElement.innerText.trim() : nameContainer.textContent.trim();
-      const profileUrl = linkElement.href;
-      const currentEmployer = employerElement ? employerElement.textContent.trim() : 'Not available';
-      if (fullName && profileUrl) {
-        results.push({ fullName, profileUrl, currentEmployer });
-      }
-      if (results.length >= 10) break;
-    }
-    return results;
-  });
-
-  console.log(`Collected ${connections.length} connections.`);
+  let currentPage = 1;
+  let hasMorePages = true;
   
-  // Save to master CSV with duplicate prevention
-  const saveResult = saveConnectionsToMaster(connections, profileUrl, 1);
-  console.log(`Page 1: ${saveResult.newConnections} new, ${saveResult.duplicateConnections} duplicates`);
-  
-  // Process emails for page 1 connections
-  console.log('Processing emails for page 1 connections...');
-  await processEmailsForPage(page, profileUrl, 1);
-
-  // Navigate to page 2 and scrape next 10
-  try {
-    console.log('Revealing pagination...');
-    await autoScroll(page);
-    await new Promise(resolve => setTimeout(resolve, 800));
-
-    // Capture the first result URN to detect list refresh
-    let firstUrn = null;
-    try {
-      firstUrn = await page.$eval('div[data-chameleon-result-urn]', el => el.getAttribute('data-chameleon-result-urn'));
-    } catch {}
-
-    const paginationContainer = 'div.artdeco-pagination';
-    const page2Button = 'li[data-test-pagination-page-btn="2"] > button';
-    const nextButton = 'button.artdeco-pagination__button--next[aria-label="Next"]';
-
-    console.log('Waiting for pagination controls...');
-    await page.waitForSelector(paginationContainer, { timeout: 20000 });
-
-    let clicked = false;
-    try {
-      await page.waitForSelector(page2Button, { timeout: 7000 });
-      await page.click(page2Button);
-      clicked = true;
-      console.log('Clicked Page 2.');
-    } catch {
-      console.log('Page 2 button not directly available, trying Next...');
-      await page.waitForSelector(nextButton, { timeout: 10000 });
-      await page.click(nextButton);
-      clicked = true;
-      console.log('Clicked Next.');
+  while (hasMorePages) {
+    console.log(`\n=== Processing Page ${currentPage} ===`);
+    
+    // Scrape connections from current page
+    const connections = await scrapeConnectionsFromPage(page, listItemSelector);
+    console.log(`Collected ${connections.length} connections from page ${currentPage}.`);
+    
+    if (connections.length === 0) {
+      console.log('No connections found on this page, stopping pagination');
+      break;
     }
-
-    if (clicked) {
-      const prevUrl = page.url();
-      await page.waitForFunction((prevUrn, prevUrl) => {
-        const first = document.querySelector('div[data-chameleon-result-urn]');
-        const currUrn = first ? first.getAttribute('data-chameleon-result-urn') : null;
-        const url = window.location.href;
-        const urlChanged = /[?&](page=2|start=\d+)/.test(url) && url !== prevUrl;
-        return (currUrn && currUrn !== prevUrn) || urlChanged;
-      }, { timeout: 20000 }, firstUrn, prevUrl);
-      console.log('Detected result-set change for Page 2.');
-
-      // Wait for results and scroll to load
-      let listItemSelector2 = 'ul[role="list"] > li';
-      try {
-        await page.waitForSelector(listItemSelector2, { timeout: 20000 });
-      } catch {
-        listItemSelector2 = 'div[data-chameleon-result-urn]';
-        await page.waitForSelector(listItemSelector2, { timeout: 20000 });
-      }
-      await autoScroll(page);
-      await new Promise(resolve => setTimeout(resolve, 1000));
-
-      console.log('Scraping Page 2 connections...');
-      const connections2 = await page.$$eval(listItemSelector2, nodes => {
-        const results = [];
-        for (const item of nodes) {
-          const nameContainer = item.querySelector('span[dir="ltr"]');
-          if (!nameContainer) continue;
-          const linkElement = nameContainer.closest('a');
-          if (!linkElement) continue;
-          const nameElement = nameContainer.querySelector('span[aria-hidden="true"]');
-          const employerElement = item.querySelector('.t-14.t-normal, .entity-result__primary-subtitle');
-          const fullName = nameElement ? nameElement.innerText.trim() : nameContainer.textContent.trim();
-          const profileUrl = linkElement.href;
-          const currentEmployer = employerElement ? employerElement.textContent.trim() : 'Not available';
-          if (fullName && profileUrl) {
-            results.push({ fullName, profileUrl, currentEmployer });
-          }
-          if (results.length >= 10) break;
-        }
-        return results;
-      });
-
-      console.log(`Collected ${connections2.length} connections from Page 2.`);
+    
+    // Save to master CSV with duplicate prevention
+    const saveResult = saveConnectionsToMaster(connections, profileUrl, currentPage);
+    console.log(`Page ${currentPage}: ${saveResult.newConnections} new, ${saveResult.duplicateConnections} duplicates`);
+    
+    // Process emails for current page connections
+    console.log(`Processing emails for page ${currentPage} connections...`);
+    await processEmailsForPage(page, profileUrl, currentPage);
+    
+    // Try to navigate to next page
+    hasMorePages = await navigateToNextPage(page, currentPage);
+    
+    if (hasMorePages) {
+      currentPage++;
       
-      // Save to master CSV with duplicate prevention
-      const saveResult2 = saveConnectionsToMaster(connections2, profileUrl, 2);
-      console.log(`Page 2: ${saveResult2.newConnections} new, ${saveResult2.duplicateConnections} duplicates`);
-
-      // Process emails for page 2 connections
-      console.log('Processing emails for page 2 connections...');
-      await processEmailsForPage(page, profileUrl, 2);
+      // Wait for new page to load and update selector if needed
+      try {
+        await page.waitForSelector(listItemSelector, { timeout: 20000 });
+      } catch {
+        listItemSelector = 'div[data-chameleon-result-urn]';
+        await page.waitForSelector(listItemSelector, { timeout: 20000 });
+      }
+    } else {
+      console.log(`\nCompleted processing all pages. Total pages processed: ${currentPage}`);
     }
-  } catch (err) {
-    console.log('Page 2 navigation or scraping skipped due to error:', err?.message || err);
   }
 
   console.log('Attempting to capture page content for debugging...');
