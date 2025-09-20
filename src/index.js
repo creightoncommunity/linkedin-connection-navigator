@@ -445,26 +445,66 @@ async function navigateToNextPage(page, currentPage) {
     console.log('You are already logged in.');
   }
 
-  // After login, navigate to the profile page first
-  await page.goto(profileUrl);
-  console.log(`Navigated to profile page for ${profileUrl}`);
+  // After login, navigate to the profile page first with retry logic
+  let navigationSuccess = false;
+  let attempts = 0;
+  const maxAttempts = 3;
+  
+  while (!navigationSuccess && attempts < maxAttempts) {
+    try {
+      attempts++;
+      console.log(`Attempting to navigate to profile page (attempt ${attempts}/${maxAttempts}): ${profileUrl}`);
+      await page.goto(profileUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      navigationSuccess = true;
+      console.log(`Successfully navigated to profile page for ${profileUrl}`);
+    } catch (error) {
+      console.log(`Navigation attempt ${attempts} failed: ${error.message}`);
+      if (attempts < maxAttempts) {
+        console.log('Retrying in 5 seconds...');
+        await humanLikeDelay(5000, 7000);
+      } else {
+        console.error('Failed to navigate to profile page after all attempts');
+        throw error;
+      }
+    }
+  }
 
   // Click the connections link with human-like behavior
   console.log('Finding and clicking connections link...');
   const connectionsLinkSelector = 'a[href*="/search/results/people/?connectionOf="]';
-  await page.waitForSelector(connectionsLinkSelector);
   
-  // Add human-like interaction
-  await randomMouseMovement(page);
-  await humanLikeDelay(500, 1200);
-  await page.hover(connectionsLinkSelector);
-  await humanLikeDelay(200, 600);
-  
-  // Click and wait for navigation to complete
-  await Promise.all([
-    page.waitForNavigation(),
-    page.click(connectionsLinkSelector),
-  ]);
+  try {
+    await page.waitForSelector(connectionsLinkSelector, { timeout: 30000 });
+    
+    // Add human-like interaction
+    await randomMouseMovement(page);
+    await humanLikeDelay(500, 1200);
+    await page.hover(connectionsLinkSelector);
+    await humanLikeDelay(200, 600);
+    
+    // Click and wait for navigation to complete
+    await Promise.all([
+      page.waitForNavigation({ timeout: 45000 }),
+      page.click(connectionsLinkSelector),
+    ]);
+    
+    console.log('Successfully navigated to connections page');
+  } catch (error) {
+    console.error('Failed to find or click connections link:', error.message);
+    console.log('This might indicate:');
+    console.log('1. The profile has no visible connections');
+    console.log('2. The profile is private or restricted');
+    console.log('3. You may not be connected to this person');
+    console.log('4. The page structure has changed');
+    
+    // Take a screenshot for debugging
+    try {
+      await page.screenshot({ path: 'debug-profile-page.png', fullPage: true });
+      console.log('Debug screenshot saved as debug-profile-page.png');
+    } catch {}
+    
+    throw error;
+  }
   
   console.log('Navigated to connections page. Now filtering for 1st degree connections...');
 
